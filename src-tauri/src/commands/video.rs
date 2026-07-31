@@ -326,6 +326,26 @@ pub fn video_native_mjpeg_start(
     Ok(serde_json::json!({ "url": format!("http://127.0.0.1:{port}/"), "transcode": transcode }))
 }
 
+/// Start a user-supplied GStreamer pipeline and expose it through Kite's existing MJPEG server.
+/// The pipeline must produce `image/jpeg`; Kite appends `multipartmux ! fdsink` itself.
+#[tauri::command(async)]
+pub fn video_gstreamer_mjpeg_start(
+    app: AppHandle,
+    pipeline: String,
+    mjpeg: State<'_, crate::video::MjpegServer>,
+) -> Result<serde_json::Value, String> {
+    let pipeline = pipeline.trim();
+    if pipeline.is_empty() {
+        return Err("custom GStreamer pipeline is empty".into());
+    }
+    let port = mjpeg.start(ended_hook(&app), &MjpegSource::Gstreamer { pipeline })?;
+    log::info!("[video] custom GStreamer MJPEG pipeline running");
+    Ok(serde_json::json!({
+        "url": format!("http://127.0.0.1:{port}/"),
+        "transcode": "gstreamer"
+    }))
+}
+
 /// Start the embedded MJPEG server on an RTSP source — the image path, **without go2rtc**.
 ///
 /// go2rtc drives an `ffmpeg:` source by having ffmpeg publish back into it over RTSP/TCP, so a stream
@@ -350,18 +370,13 @@ pub fn video_rtsp_mjpeg_start(
         serde_json::json!({ "url": format!("http://127.0.0.1:{port}/"), "transcode": t.label() })
     };
 
-    // Try the stream copy first. A source that already sends MJPEG is cheaper by a wide margin
-    // (measured on this very stream: 7.4 % of a core against 47.6 % for a transcode), and trying is
-    // the only way to know — the mpjpeg muxer rejects anything that isn't MJPEG, so the attempt costs
-    // a failed spawn rather than a probe.
-    let copy = MjpegSource::Rtsp { url: &url, transcode: RtspTranscode::Copy };
-    match mjpeg.start(ended_hook(&app), &copy) {
-        Ok(port) => {
-            log::info!("[video] RTSP source already carries MJPEG — stream-copied, no transcode");
-            return Ok(reply(port, RtspTranscode::Copy));
-        }
-        Err(e) if require_copy => return Err(format!("source does not carry MJPEG: {e}")),
-        Err(e) => log::debug!("[video] no MJPEG track in the source ({e}) — transcoding instead"),
+    // Do not use the old stream-copy probe here. `MjpegServer::start` only proved that ffmpeg
+    // emitted bytes; ffmpeg can stream-copy H.264 packets through the mpjpeg muxer, which made an
+    // H.264 source look like MJPEG and left WebKit decoding a corrupt black stream. The ordinary
+    // image fallback therefore always transcodes to actual JPEG frames. A caller that explicitly
+    // requires copy (the post-WebRTC MJPEG probe) must fail rather than silently downgrade.
+    if require_copy {
+        return Err("reliable MJPEG stream-copy detection is unavailable".into());
     }
 
     // V4L2 M2M is the Pi-class path (hardware decode only, no MJPEG encoder exists for it); VAAPI is
