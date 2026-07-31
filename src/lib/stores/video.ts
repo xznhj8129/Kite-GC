@@ -87,6 +87,8 @@ export interface VideoState {
   rtspUrl: string;
   /** Transport for the active RTSP connection (udp/tcp/auto). */
   rtspTransport: RtspTransport;
+  /** Expert Linux override. Non-empty bypasses URL/transport/go2rtc and runs gst-launch. */
+  gstreamerPipeline: string;
   /** Saved, named RTSP connections the user can recall (explicit save — never auto-added). */
   rtspConnections: RtspConnection[];
   /** Active RTSP reader once live (native go2rtc client vs ffmpeg fallback); runtime-only. */
@@ -151,6 +153,7 @@ interface VideoPrefs {
   cameraFps: CameraFps;
   rtspUrl: string;
   rtspTransport: RtspTransport;
+  gstreamerPipeline: string;
   rtspConnections: RtspConnection[];
   nativeDevice: string | null;
   nativeCodec: string;
@@ -175,6 +178,7 @@ const PREF_DEFAULTS: VideoPrefs = {
   cameraFps: 'auto',
   rtspUrl: '',
   rtspTransport: 'auto',
+  gstreamerPipeline: '',
   rtspConnections: [],
   nativeDevice: null,
   nativeCodec: 'mjpeg',
@@ -207,6 +211,7 @@ function loadPrefs(): VideoPrefs {
         cameraFps: p.cameraFps ?? 'auto',
         rtspUrl: p.rtspUrl ?? '',
         rtspTransport: p.rtspTransport ?? 'auto',
+        gstreamerPipeline: p.gstreamerPipeline ?? '',
         rtspConnections: Array.isArray(p.rtspConnections) ? p.rtspConnections : [],
         nativeDevice: p.nativeDevice ?? p.v4l2Device ?? null,
         nativeCodec: p.nativeCodec ?? 'mjpeg',
@@ -237,6 +242,7 @@ function savePrefs(): void {
         cameraFps: s.cameraFps,
         rtspUrl: s.rtspUrl,
         rtspTransport: s.rtspTransport,
+        gstreamerPipeline: s.gstreamerPipeline,
         rtspConnections: s.rtspConnections,
         nativeDevice: s.nativeDevice,
         nativeCodec: s.nativeSel.codec,
@@ -280,6 +286,7 @@ const INITIAL: VideoState = {
   },
   rtspUrl: boot.rtspUrl,
   rtspTransport: boot.rtspTransport,
+  gstreamerPipeline: boot.gstreamerPipeline,
   rtspConnections: boot.rtspConnections,
   rtspEngine: null,
   reconnecting: false,
@@ -426,6 +433,16 @@ async function startNativeMjpeg(
 /** Stop the built-in MJPEG server. */
 async function stopNativeMjpeg(): Promise<void> {
   await invoke('video_native_mjpeg_stop').catch(() => {});
+}
+
+
+/** Run the expert GStreamer source through the same embedded MJPEG fan-out as native/RTSP fallback. */
+async function startGstreamerMjpeg(
+  pipeline: string,
+): Promise<{ url: string; transcode: string }> {
+  return await invoke<{ url: string; transcode: string }>('video_gstreamer_mjpeg_start', {
+    pipeline,
+  });
 }
 
 /** Enumerate video input devices. Labels are only populated once permission has
@@ -968,7 +985,10 @@ function scheduleRtspReconnect(): void {
   // never comes back. Log the first few, then every tenth — enough to see it is still going.
   const attempt = st.reconnectAttempt + 1;
   if (attempt <= 3 || attempt % 10 === 0) {
-    logVideo('warn', `RTSP reconnect attempt ${attempt} (${st.rtspUrl}, transport=${st.rtspTransport})`);
+    const source = st.gstreamerPipeline.trim()
+      ? 'custom GStreamer pipeline'
+      : `${st.rtspUrl}, transport=${st.rtspTransport}`;
+    logVideo('warn', `RTSP reconnect attempt ${attempt} (${source})`);
   }
   clearRtspTimers();
   closeRtc();
@@ -1013,9 +1033,11 @@ export async function startRtsp(opts?: { reconnect?: boolean }): Promise<void> {
   clearRtspTimers();
   stopTracks(); // release the camera / previous peer connection
   const st = get(videoState);
+  const pipeline = isLinux ? st.gstreamerPipeline.trim() : '';
+  const usingGstreamer = pipeline.length > 0;
   const url = st.rtspUrl.trim();
   const transport = st.rtspTransport;
-  if (!url) {
+  if (!usingGstreamer && !url) {
     patch({ kind: 'rtsp', enabled: true, status: 'error', error: 'No RTSP URL', reconnecting: false, reconnectAttempt: 0 });
     return;
   }
@@ -1031,6 +1053,33 @@ export async function startRtsp(opts?: { reconnect?: boolean }): Promise<void> {
   if (!reconnect) {
     savePrefs();
     rtspMjpegFailures = 0; // a deliberate (re)start gets the hardware decoder another chance
+  }
+
+  if (usingGstreamer) {
+    if (!reconnect) logVideo('info', 'Custom GStreamer pipeline start (URL/transport bypassed)');
+    try {
+      const { url: mjpegUrl, transcode } = await startGstreamerMjpeg(pipeline);
+      if (get(videoState).kind !== 'rtsp' || !get(videoState).enabled) {
+        void stopNativeMjpeg();
+        return;
+      }
+      patch({
+        status: 'live',
+        reconnecting: false,
+        reconnectAttempt: 0,
+        mjpegUrl,
+        activeTranscode: transcode,
+        rtspEngine: null,
+        error: null,
+      });
+    } catch (err) {
+      logVideo(
+        'warn',
+        `Custom GStreamer pipeline failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      scheduleRtspReconnect();
+    }
+    return;
   }
 
   // MJPEG fallback for webviews without RTCPeerConnection (rare in Tauri). Decided BEFORE the engine
@@ -1212,6 +1261,14 @@ export function setRtspUrl(rtspUrl: string): void {
   savePrefs();
 }
 
+/** Set the Linux expert pipeline. Non-empty overrides the normal RTSP URL/transport path. */
+export async function setGstreamerPipeline(gstreamerPipeline: string): Promise<void> {
+  patch({ gstreamerPipeline });
+  savePrefs();
+  const st = get(videoState);
+  if (st.enabled && st.kind === 'rtsp') await startRtsp();
+}
+
 /** Set the active RTSP transport (udp/tcp/auto); restart if currently on a live RTSP feed. */
 export async function setRtspTransport(transport: RtspTransport): Promise<void> {
   patch({ rtspTransport: transport });
@@ -1270,7 +1327,7 @@ export async function selectRtspConnection(id: string): Promise<void> {
   const c = get(videoState).rtspConnections.find((x) => x.id === id);
   if (!c) return;
   if (get(videoState).kind !== 'rtsp' && get(videoState).enabled) stopVideo();
-  patch({ kind: 'rtsp', rtspUrl: c.url, rtspTransport: c.transport });
+  patch({ kind: 'rtsp', rtspUrl: c.url, rtspTransport: c.transport, gstreamerPipeline: '' });
   savePrefs();
   await startRtsp();
 }

@@ -64,16 +64,36 @@ pub fn mav_arm(arm: bool, force: bool, state: State<'_, AppState>) -> Result<(),
     )
 }
 
-/// Take off to `altitude` (m, relative to home) via `MAV_CMD_NAV_TAKEOFF`.
+/// Take off via `MAV_CMD_NAV_TAKEOFF`.
+///
+/// ArduPilot keeps the existing relative-altitude command. PX4 requires an AMSL target and
+/// treats zero-valued optional yaw/latitude/longitude fields as real coordinates, so the
+/// frontend supplies `altitude_amsl` and those fields are sent as NaN, matching QGroundControl.
 #[tauri::command(async)]
-pub fn mav_takeoff(altitude: f32, state: State<'_, AppState>) -> Result<(), String> {
+pub fn mav_takeoff(
+    altitude: f32,
+    altitude_amsl: Option<f32>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let (cmd_tx, fc_sysid) = mav_handle(&state)?;
-    // param7 = altitude; lat/lon (param5/6) = 0 → take off in place.
+    let params = match altitude_amsl {
+        Some(target) if target.is_finite() => [
+            f32::NAN,
+            f32::NAN,
+            0.0,
+            f32::NAN,
+            f32::NAN,
+            f32::NAN,
+            target,
+        ],
+        Some(_) => return Err("PX4 takeoff requires a finite AMSL target".into()),
+        None => [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, altitude],
+    };
     control::send_command_long(
         &cmd_tx,
         fc_sysid,
         MavCmd::MAV_CMD_NAV_TAKEOFF,
-        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, altitude],
+        params,
     )
 }
 

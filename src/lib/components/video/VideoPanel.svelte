@@ -27,6 +27,7 @@
     setDisableHwAccel,
     setVideoKind,
     setRtspUrl,
+    setGstreamerPipeline,
     setRtspTransport,
     saveRtspConnection,
     updateRtspConnection,
@@ -289,6 +290,7 @@
     const s = $videoState;
     if (s.kind !== 'rtsp' || s.status !== 'live') return null;
     if (!s.mjpegUrl) return $videoRtcStats?.codec ?? null;
+    if (s.activeTranscode === 'gstreamer') return 'Custom GStreamer → MJPEG';
     return s.activeTranscode === 'copy' ? 'MJPEG' : 'H.264 → MJPEG';
   });
   const streamBitrate = $derived.by(() => {
@@ -315,6 +317,9 @@
     if (s.status !== 'live') return null;
     if (s.mjpegUrl) {
       const mode = s.activeTranscode;
+      if (mode === 'gstreamer') {
+        return { method: 'GStreamer → MJPEG', transcode: null, transcodeHw: false, surfaceHw: false };
+      }
       const engine = mode ? TRANSCODE_LABEL[mode] : undefined;
       const via = engine ?? (mode === 'copy' ? $t('video.pipeline.copy') : undefined);
       return {
@@ -339,7 +344,7 @@
 {#snippet headerActions()}
   <Button
     variant={$videoState.enabled ? 'danger' : 'data'}
-    disabled={!$videoState.enabled && $videoState.kind === 'rtsp' && needsEngine && engineChecked && !engineVer}
+    disabled={!$videoState.enabled && $videoState.kind === 'rtsp' && needsEngine && engineChecked && !engineVer && !$videoState.gstreamerPipeline.trim()}
     onclick={toggleVideo}
   >
     {$videoState.enabled ? $t('video.stop') : $t('video.start')}
@@ -582,6 +587,23 @@
         </div>
       </div>
 
+      {#if isLinux}
+        <details class="gst-custom" open={!!$videoState.gstreamerPipeline.trim()}>
+          <summary>Custom GStreamer pipeline</summary>
+          <textarea
+            rows="4"
+            spellcheck="false"
+            placeholder="rtspsrc location=rtsp://… latency=0 ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! jpegenc quality=85"
+            value={$videoState.gstreamerPipeline}
+            onchange={(e) => void setGstreamerPipeline(inputVal(e))}
+          ></textarea>
+          <p class="hint">
+            Non-empty overrides the RTSP URL, transport, go2rtc and ffmpeg paths. The pipeline must
+            output image/jpeg; Kite appends multipartmux and fdsink for its existing video surfaces.
+          </p>
+        </details>
+      {/if}
+
       <!-- Saved connections: single-line rows, selectable / editable / deletable (ADS-B-provider style). -->
       {#if $videoState.rtspConnections.length}
         <div class="rtsp-list">
@@ -623,7 +645,7 @@
         </div>
       {/if}
 
-      {#if needsEngine && engineChecked && !engineVer}
+      {#if needsEngine && engineChecked && !engineVer && !$videoState.gstreamerPipeline.trim()}
         <!-- go2rtc is required for the WebRTC path only — see `needsEngine`. -->
         <div class="ffmpeg-box">
           <p class="hint">{$t('video.engineMissing')}</p>
@@ -638,7 +660,7 @@
             {#if engineMsg}<p class="hint err">{engineMsg}</p>{/if}
           {/if}
         </div>
-      {:else if engineVer}
+      {:else if engineVer && !$videoState.gstreamerPipeline.trim()}
         {#if $videoState.status === 'live' && $videoState.rtspEngine && !$videoState.mjpegUrl}
           <!-- Which reader go2rtc uses — a WebRTC-path question. The image path does not go through
                go2rtc at all, and the pipeline line above already names what it runs. -->
@@ -800,6 +822,32 @@
   }
   .hint { font-size: 11px; color: #777; margin: 0; }
   .hint.err { color: #d40000; }
+
+  .gst-custom {
+    padding: 7px 8px;
+    background: rgba(255, 255, 255, 0.035);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 4px;
+  }
+  .gst-custom summary {
+    cursor: pointer;
+    color: #aaa;
+    font-size: 12px;
+    user-select: none;
+  }
+  .gst-custom textarea {
+    box-sizing: border-box;
+    width: 100%;
+    min-height: 84px;
+    margin: 7px 0 5px;
+    padding: 7px 8px;
+    resize: vertical;
+    background: #292929;
+    color: #e0e0e0;
+    border: 1px solid #555;
+    border-radius: 4px;
+    font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
 
   /* RTSP direct-connect row + saved-connection list */
   .rtsp-url-row { display: flex; align-items: center; gap: 6px; }

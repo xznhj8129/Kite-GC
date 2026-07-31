@@ -138,7 +138,8 @@ export function disarm(force = false): Promise<boolean> {
  */
 export async function takeoff(altitude: number): Promise<boolean> {
   guidedTarget.set(null); // fresh flight phase — no carried-over Guided target
-  if (get(autopilotSystem) === 'ardupilot') {
+  const system = get(autopilotSystem);
+  if (system === 'ardupilot') {
     const g = guidedModeFor('ardupilot', get(arduVehicleClass));
     if (g && get(activeMode)?.key !== g.key) {
       try {
@@ -149,7 +150,22 @@ export async function takeoff(altitude: number): Promise<boolean> {
       }
     }
   }
-  return runCommand('takeoff', 'mav_takeoff', { altitude });
+
+  let altitudeAmsl: number | null = null;
+  if (system === 'px4') {
+    const tel = get(telemetry);
+    if (tel.lastUpdate === 0 || !Number.isFinite(tel.altMsl)) {
+      lastFeedback.set({
+        action: 'takeoff',
+        ok: false,
+        message: 'PX4 takeoff requires a valid MSL altitude',
+        ts: Date.now(),
+      });
+      return false;
+    }
+    altitudeAmsl = tel.altMsl + altitude;
+  }
+  return runCommand('takeoff', 'mav_takeoff', { altitude, altitudeAmsl });
 }
 
 export function land(): Promise<boolean> {
